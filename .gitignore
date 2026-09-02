@@ -1,0 +1,5 @@
+# Ignore all Python generated files
+__pycache__/
+*.py[cod]
+
+!.gitignore
