@@ -1,0 +1,2 @@
+aiortc>=1.15,<2
+websockets>=15,<16

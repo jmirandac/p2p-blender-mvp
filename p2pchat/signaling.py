@@ -1,121 +1,165 @@
-"""One-shot room matching server. It never relays chat messages."""
+"""Room-based WebSocket signaling for aiortc peers."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
-from .wire import read_message, write_message
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
 
 ROOM_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @dataclass
-class WaitingPeer:
+class Peer:
     peer_id: str
-    public_endpoint: list[object]
-    local_endpoint: list[object]
-    writer: asyncio.StreamWriter
-
-    def description(self) -> dict[str, object]:
-        return {
-            "peer_id": self.peer_id,
-            "public_endpoint": self.public_endpoint,
-            "local_endpoint": self.local_endpoint,
-        }
+    room: str
+    websocket: ServerConnection
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class SignalingServer:
+    """Pair two peers per room and relay only their WebRTC descriptions."""
+
     def __init__(self) -> None:
-        self.waiting: dict[str, WaitingPeer] = {}
+        self.waiting: dict[str, Peer] = {}
+        self.partners: dict[ServerConnection, Peer] = {}
         self.lock = asyncio.Lock()
 
     @staticmethod
-    def _endpoint(value: object, name: str) -> list[object]:
-        if not isinstance(value, list) or len(value) != 2:
-            raise ValueError(f"{name} no es un endpoint válido")
-        host, port = value
-        if not isinstance(host, str) or not isinstance(port, int) or not (1 <= port <= 65535):
-            raise ValueError(f"{name} no es un endpoint válido")
-        return [host, port]
+    def _decode(raw: str | bytes) -> dict[str, Any]:
+        if not isinstance(raw, str):
+            raise ValueError("se esperaba un mensaje de texto")
+        if len(raw.encode("utf-8")) > 1_000_000:
+            raise ValueError("mensaje demasiado grande")
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("se esperaba un objeto JSON")
+        return value
 
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        peer: WaitingPeer | None = None
-        room = ""
-        try:
-            request = await asyncio.wait_for(read_message(reader), timeout=10)
-            if request.get("type") != "join":
-                raise ValueError("el primer mensaje debe ser join")
-            room = request.get("room", "")
-            peer_id = request.get("peer_id", "")
-            if not isinstance(room, str) or not ROOM_PATTERN.fullmatch(room):
-                raise ValueError("código de sala inválido")
-            if not isinstance(peer_id, str) or not ROOM_PATTERN.fullmatch(peer_id):
-                raise ValueError("identificador de peer inválido")
+    @staticmethod
+    async def _send(peer: Peer, message: dict[str, Any]) -> None:
+        async with peer.send_lock:
+            await peer.websocket.send(json.dumps(message, separators=(",", ":")))
 
-            peer = WaitingPeer(
-                peer_id=peer_id,
-                public_endpoint=self._endpoint(request.get("public_endpoint"), "public_endpoint"),
-                local_endpoint=self._endpoint(request.get("local_endpoint"), "local_endpoint"),
-                writer=writer,
-            )
+    async def _join(self, websocket: ServerConnection) -> Peer:
+        raw = await asyncio.wait_for(websocket.recv(), timeout=10)
+        request = self._decode(raw)
+        if request.get("type") != "join":
+            raise ValueError("el primer mensaje debe ser join")
 
-            async with self.lock:
-                other = self.waiting.pop(room, None)
-                if other is None or other.writer.is_closing():
-                    self.waiting[room] = peer
-                    other = None
+        room = request.get("room", "")
+        peer_id = request.get("peer_id", "")
+        if not isinstance(room, str) or not ROOM_PATTERN.fullmatch(room):
+            raise ValueError("código de sala inválido")
+        if not isinstance(peer_id, str) or not ROOM_PATTERN.fullmatch(peer_id):
+            raise ValueError("identificador de peer inválido")
 
-            if other is None:
-                await write_message(writer, {"type": "waiting"})
-                await reader.read()
-                return
-
-            if other.peer_id == peer.peer_id:
+        peer = Peer(peer_id=peer_id, room=room, websocket=websocket)
+        async with self.lock:
+            other = self.waiting.pop(room, None)
+            if other is not None and other.peer_id == peer_id:
+                self.waiting[room] = other
                 raise ValueError("los peers deben usar identificadores diferentes")
+            if other is None:
+                self.waiting[room] = peer
+            else:
+                self.partners[websocket] = other
+                self.partners[other.websocket] = peer
 
-            await write_message(other.writer, {"type": "matched", "peer": peer.description()})
-            await write_message(writer, {"type": "matched", "peer": other.description()})
-            other.writer.close()
-            with contextlib.suppress(ConnectionError):
-                await other.writer.wait_closed()
-        except (EOFError, ValueError, asyncio.TimeoutError) as exc:
-            with contextlib.suppress(ConnectionError):
-                await write_message(writer, {"type": "error", "message": str(exc)})
+        if other is None:
+            await self._send(peer, {"type": "waiting"})
+        else:
+            await asyncio.gather(
+                self._send(
+                    other,
+                    {"type": "matched", "peer_id": peer.peer_id, "initiator": True},
+                ),
+                self._send(
+                    peer,
+                    {"type": "matched", "peer_id": other.peer_id, "initiator": False},
+                ),
+            )
+        return peer
+
+    @staticmethod
+    def _validated_description(message: dict[str, Any]) -> dict[str, str]:
+        description = message.get("description")
+        if not isinstance(description, dict):
+            raise ValueError("descripción WebRTC inválida")
+        kind = description.get("type")
+        sdp = description.get("sdp")
+        if kind not in ("offer", "answer") or not isinstance(sdp, str) or not sdp:
+            raise ValueError("descripción WebRTC inválida")
+        return {"type": kind, "sdp": sdp}
+
+    async def handle(self, websocket: ServerConnection) -> None:
+        peer: Peer | None = None
+        try:
+            peer = await self._join(websocket)
+            async for raw in websocket:
+                message = self._decode(raw)
+                if message.get("type") != "description":
+                    raise ValueError("solo se pueden retransmitir descripciones WebRTC")
+                description = self._validated_description(message)
+                async with self.lock:
+                    partner = self.partners.get(websocket)
+                if partner is None:
+                    raise ValueError("el peer aún no está emparejado")
+                await self._send(
+                    partner, {"type": "description", "description": description}
+                )
+        except (ConnectionClosed, asyncio.TimeoutError):
+            pass
+        except (json.JSONDecodeError, ValueError) as exc:
+            if peer is None:
+                peer = Peer(peer_id="", room="", websocket=websocket)
+            try:
+                await self._send(peer, {"type": "error", "message": str(exc)})
+            except ConnectionClosed:
+                pass
         finally:
             if peer is not None:
-                async with self.lock:
-                    if self.waiting.get(room) is peer:
-                        self.waiting.pop(room, None)
-            writer.close()
-            with contextlib.suppress(ConnectionError):
-                await writer.wait_closed()
+                await self._remove(peer)
+
+    async def _remove(self, peer: Peer) -> None:
+        async with self.lock:
+            if self.waiting.get(peer.room) is peer:
+                self.waiting.pop(peer.room, None)
+            partner = self.partners.pop(peer.websocket, None)
+            if partner is not None:
+                self.partners.pop(partner.websocket, None)
+        if partner is not None:
+            try:
+                await self._send(partner, {"type": "peer-left"})
+            except ConnectionClosed:
+                pass
 
 
-async def serve(host: str, port: int) -> None:
+async def run_server(host: str, port: int) -> None:
     app = SignalingServer()
-    server = await asyncio.start_server(app.handle, host, port)
-    addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
-    print(f"Servidor de señalización escuchando en {addresses}")
-    async with server:
+    async with serve(app.handle, host, port, max_size=1_000_000) as server:
+        addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets)
+        print(f"Servidor de señalización WebSocket escuchando en {addresses}")
         await server.serve_forever()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Servidor de señalización para el chat P2P")
+    parser = argparse.ArgumentParser(description="Señalización WebSocket para el chat P2P")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9000)
     args = parser.parse_args()
     try:
-        asyncio.run(serve(args.host, args.port))
+        asyncio.run(run_server(args.host, args.port))
     except KeyboardInterrupt:
         pass
 
 
 if __name__ == "__main__":
     main()
-

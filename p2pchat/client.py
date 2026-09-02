@@ -1,213 +1,302 @@
-"""Terminal client using STUN, signaling, and direct UDP traffic."""
+"""Terminal chat backed by an aiortc WebRTC data channel."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import secrets
-import socket
-import threading
-import time
+from collections.abc import Callable
 from typing import Any
 
-from .stun import StunError, discover_public_endpoint
-from .wire import read_message, write_message
+from aiortc import (
+    RTCConfiguration,
+    RTCDataChannel,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
+)
+from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import ConnectionClosed
 
 
-def local_ip_for(remote_host: str, remote_port: int) -> str:
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        probe.connect((remote_host, remote_port))
-        return probe.getsockname()[0]
-    finally:
-        probe.close()
+DEFAULT_STUN_URL = "stun:stun.l.google.com:19302"
 
 
-async def match_peer(
-    server_host: str,
-    server_port: int,
-    room: str,
-    peer_id: str,
-    public_endpoint: tuple[str, int],
-    local_endpoint: tuple[str, int],
-) -> dict[str, Any]:
-    reader, writer = await asyncio.open_connection(server_host, server_port)
-    try:
-        await write_message(
-            writer,
-            {
-                "type": "join",
-                "room": room,
-                "peer_id": peer_id,
-                "public_endpoint": list(public_endpoint),
-                "local_endpoint": list(local_endpoint),
-            },
+class WebRTCChat:
+    """Own a peer connection and expose a small text-chat interface."""
+
+    def __init__(
+        self,
+        peer_id: str,
+        remote_id: str,
+        *,
+        stun_url: str = DEFAULT_STUN_URL,
+        on_message: Callable[[str], None] | None = None,
+    ) -> None:
+        configuration = RTCConfiguration(
+            iceServers=[RTCIceServer(urls=stun_url)] if stun_url else []
         )
-        while True:
-            message = await read_message(reader)
-            if message.get("type") == "waiting":
-                print("Esperando al segundo participante…")
-            elif message.get("type") == "matched":
-                peer = message.get("peer")
-                if not isinstance(peer, dict):
-                    raise RuntimeError("respuesta matched inválida")
-                return peer
-            elif message.get("type") == "error":
-                raise RuntimeError(str(message.get("message", "error de señalización")))
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-
-class DirectChat:
-    def __init__(self, udp_socket: socket.socket, peer_id: str, remote: dict[str, Any]) -> None:
-        self.socket = udp_socket
         self.peer_id = peer_id
-        self.remote_id = str(remote["peer_id"])
-        self.candidates = {
-            (str(remote["public_endpoint"][0]), int(remote["public_endpoint"][1])),
-            (str(remote["local_endpoint"][0]), int(remote["local_endpoint"][1])),
-        }
-        self.active_endpoint: tuple[str, int] | None = None
-        self.connected = threading.Event()
-        self.stopped = threading.Event()
-        self.lock = threading.Lock()
+        self.remote_id = remote_id
+        self.connection = RTCPeerConnection(configuration=configuration)
+        self.channel: RTCDataChannel | None = None
+        self.ready = asyncio.Event()
+        self.closed = asyncio.Event()
+        self._on_message = on_message or self._print_message
 
-    def _send(self, message: dict[str, object], endpoint: tuple[str, int]) -> None:
-        payload = json.dumps(message, separators=(",", ":")).encode()
-        if len(payload) > 4096:
-            raise ValueError("mensaje demasiado largo")
-        self.socket.sendto(payload, endpoint)
+        @self.connection.on("datachannel")
+        def on_datachannel(channel: RTCDataChannel) -> None:
+            self._attach_channel(channel)
 
-    def receiver(self) -> None:
-        self.socket.settimeout(0.5)
-        while not self.stopped.is_set():
+        @self.connection.on("connectionstatechange")
+        async def on_connectionstatechange() -> None:
+            if self.connection.connectionState in ("closed", "failed"):
+                self.closed.set()
+
+    def _print_message(self, text: str) -> None:
+        print(f"\r{self.remote_id}> {text}\nyo> ", end="", flush=True)
+
+    def _attach_channel(self, channel: RTCDataChannel) -> None:
+        self.channel = channel
+
+        @channel.on("open")
+        def on_open() -> None:
+            self.ready.set()
+
+        @channel.on("close")
+        def on_close() -> None:
+            self.closed.set()
+
+        @channel.on("message")
+        def on_message(payload: str | bytes) -> None:
             try:
-                payload, source = self.socket.recvfrom(8192)
+                if isinstance(payload, bytes):
+                    payload = payload.decode("utf-8")
                 message = json.loads(payload)
-                if not isinstance(message, dict) or message.get("peer_id") != self.remote_id:
-                    continue
-                message_type = message.get("type")
-                if message_type in ("punch", "ack"):
-                    with self.lock:
-                        self.active_endpoint = source
-                    self.connected.set()
-                    if message_type == "punch":
-                        self._send({"type": "ack", "peer_id": self.peer_id}, source)
-                elif message_type == "chat":
-                    with self.lock:
-                        self.active_endpoint = source
-                    self.connected.set()
-                    text = str(message.get("text", ""))
-                    print(f"\r{self.remote_id}> {text}\nyo> ", end="", flush=True)
-                elif message_type == "bye":
-                    print(f"\n{self.remote_id} ha cerrado el chat.")
-                    self.stopped.set()
-            except socket.timeout:
-                continue
-            except (OSError, ValueError, json.JSONDecodeError):
-                if not self.stopped.is_set():
-                    continue
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                return
+            if not isinstance(message, dict) or message.get("peer_id") != self.remote_id:
+                return
+            if message.get("type") == "chat":
+                self._on_message(str(message.get("text", "")))
+            elif message.get("type") == "bye":
+                print(f"\n{self.remote_id} ha cerrado el chat.")
+                self.closed.set()
 
-    def punch(self, timeout: float = 15.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and not self.connected.is_set():
-            for endpoint in self.candidates:
-                try:
-                    self._send({"type": "punch", "peer_id": self.peer_id}, endpoint)
-                except OSError:
-                    pass
-            self.connected.wait(0.4)
-        return self.connected.is_set()
+        # aiortc emits "datachannel" once the remotely-created channel is open,
+        # so the answerer may attach its handlers after the "open" event.
+        if channel.readyState == "open":
+            self.ready.set()
+
+    async def create_offer(self) -> RTCSessionDescription:
+        self._attach_channel(self.connection.createDataChannel("chat"))
+        await self.connection.setLocalDescription(await self.connection.createOffer())
+        assert self.connection.localDescription is not None
+        return self.connection.localDescription
+
+    async def accept_offer(
+        self, description: RTCSessionDescription
+    ) -> RTCSessionDescription:
+        await self.connection.setRemoteDescription(description)
+        await self.connection.setLocalDescription(await self.connection.createAnswer())
+        assert self.connection.localDescription is not None
+        return self.connection.localDescription
+
+    async def accept_answer(self, description: RTCSessionDescription) -> None:
+        await self.connection.setRemoteDescription(description)
 
     def send_chat(self, text: str) -> None:
-        with self.lock:
-            endpoint = self.active_endpoint
-        if endpoint is None:
+        if self.channel is None or self.channel.readyState != "open":
             raise RuntimeError("la conexión P2P aún no está lista")
-        self._send({"type": "chat", "peer_id": self.peer_id, "text": text}, endpoint)
-
-    def close(self) -> None:
-        with self.lock:
-            endpoint = self.active_endpoint
-        if endpoint:
-            try:
-                self._send({"type": "bye", "peer_id": self.peer_id}, endpoint)
-            except OSError:
-                pass
-        self.stopped.set()
-        self.socket.close()
-
-
-def run(args: argparse.Namespace) -> int:
-    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_socket.bind(("0.0.0.0", args.udp_port))
-    actual_port = udp_socket.getsockname()[1]
-
-    print("Consultando STUN de Google…")
-    try:
-        public_endpoint = discover_public_endpoint(udp_socket)
-    except StunError as exc:
-        udp_socket.close()
-        print(f"Error: {exc}")
-        return 1
-
-    local_endpoint = (local_ip_for(args.server, args.port), actual_port)
-    print(f"Endpoint local: {local_endpoint[0]}:{local_endpoint[1]}")
-    print(f"Endpoint público según STUN: {public_endpoint[0]}:{public_endpoint[1]}")
-    print(f"Uniéndose a la sala {args.room!r} como {args.name!r}…")
-
-    try:
-        remote = asyncio.run(
-            match_peer(
-                args.server,
-                args.port,
-                args.room,
-                args.name,
-                public_endpoint,
-                local_endpoint,
+        self.channel.send(
+            json.dumps(
+                {"type": "chat", "peer_id": self.peer_id, "text": text},
+                separators=(",", ":"),
             )
         )
-    except (OSError, EOFError, RuntimeError) as exc:
-        udp_socket.close()
-        print(f"Error de señalización: {exc}")
-        return 1
 
-    print(f"Peer encontrado: {remote['peer_id']}. Abriendo ruta UDP directa…")
-    chat = DirectChat(udp_socket, args.name, remote)
-    receiver = threading.Thread(target=chat.receiver, daemon=True)
-    receiver.start()
-    if not chat.punch():
-        chat.close()
-        print("No se pudo crear la ruta directa. Algún NAT puede impedir el hole punching UDP.")
-        return 2
+    async def close(self, *, notify: bool = True) -> None:
+        if notify and self.channel is not None and self.channel.readyState == "open":
+            self.channel.send(
+                json.dumps(
+                    {"type": "bye", "peer_id": self.peer_id}, separators=(",", ":")
+                )
+            )
+            await asyncio.sleep(0)
+        await self.connection.close()
+        self.closed.set()
 
-    print("Conexión P2P directa establecida. Escribe /salir para terminar.")
+
+def _description_from_message(message: dict[str, Any]) -> RTCSessionDescription:
+    value = message.get("description")
+    if not isinstance(value, dict):
+        raise RuntimeError("descripción WebRTC inválida")
+    sdp = value.get("sdp")
+    kind = value.get("type")
+    if not isinstance(sdp, str) or kind not in ("offer", "answer"):
+        raise RuntimeError("descripción WebRTC inválida")
+    return RTCSessionDescription(sdp=sdp, type=kind)
+
+
+async def _send_description(
+    websocket: ClientConnection, description: RTCSessionDescription
+) -> None:
+    await websocket.send(
+        json.dumps(
+            {
+                "type": "description",
+                "description": {"sdp": description.sdp, "type": description.type},
+            },
+            separators=(",", ":"),
+        )
+    )
+
+
+async def _receive_json(websocket: ClientConnection) -> dict[str, Any]:
+    raw = await websocket.recv()
+    if not isinstance(raw, str):
+        raise RuntimeError("respuesta de señalización no textual")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise RuntimeError("respuesta de señalización inválida")
+    return value
+
+
+async def _receive_until_ready(
+    websocket: ClientConnection, chat: WebRTCChat
+) -> dict[str, Any] | None:
+    receive_task = asyncio.create_task(_receive_json(websocket))
+    ready_task = asyncio.create_task(chat.ready.wait())
+    closed_task = asyncio.create_task(chat.closed.wait())
+    tasks = {receive_task, ready_task, closed_task}
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    if receive_task in done:
+        return receive_task.result()
+    if ready_task in done and chat.ready.is_set():
+        return None
+    raise RuntimeError("la conexión WebRTC se cerró durante la negociación")
+
+
+async def match_and_connect(
+    websocket: ClientConnection,
+    room: str,
+    peer_id: str,
+    stun_url: str,
+) -> WebRTCChat:
+    await websocket.send(
+        json.dumps(
+            {"type": "join", "room": room, "peer_id": peer_id},
+            separators=(",", ":"),
+        )
+    )
+
+    while True:
+        message = await _receive_json(websocket)
+        message_type = message.get("type")
+        if message_type == "waiting":
+            print("Esperando al segundo participante…")
+        elif message_type == "matched":
+            remote_id = message.get("peer_id")
+            if not isinstance(remote_id, str):
+                raise RuntimeError("respuesta matched inválida")
+            initiator = message.get("initiator") is True
+            break
+        elif message_type == "error":
+            raise RuntimeError(str(message.get("message", "error de señalización")))
+
+    chat = WebRTCChat(peer_id, remote_id, stun_url=stun_url)
     try:
-        while not chat.stopped.is_set():
-            text = input("yo> ")
-            if text.strip() == "/salir":
+        if initiator:
+            await _send_description(websocket, await chat.create_offer())
+
+        while not chat.ready.is_set():
+            message = await _receive_until_ready(websocket, chat)
+            if message is None:
                 break
-            if text:
-                chat.send_chat(text)
+            message_type = message.get("type")
+            if message_type == "description":
+                description = _description_from_message(message)
+                if description.type == "offer":
+                    await _send_description(
+                        websocket, await chat.accept_offer(description)
+                    )
+                elif description.type == "answer":
+                    await chat.accept_answer(description)
+            elif message_type == "peer-left":
+                raise RuntimeError("el otro peer se desconectó durante la negociación")
+            elif message_type == "error":
+                raise RuntimeError(
+                    str(message.get("message", "error de señalización"))
+                )
+
+            if chat.connection.connectionState == "failed":
+                raise RuntimeError("falló la negociación ICE")
+    except BaseException:
+        await chat.close(notify=False)
+        raise
+
+    return chat
+
+
+async def run(args: argparse.Namespace) -> int:
+    scheme = "wss" if args.secure else "ws"
+    uri = f"{scheme}://{args.server}:{args.port}"
+    print(f"Uniéndose a la sala {args.room!r} como {args.name!r}…")
+
+    chat: WebRTCChat | None = None
+    try:
+        async with connect(uri, open_timeout=10) as websocket:
+            chat = await asyncio.wait_for(
+                match_and_connect(websocket, args.room, args.name, args.stun_server),
+                timeout=args.connect_timeout,
+            )
+            print(
+                f"Conexión WebRTC P2P con {chat.remote_id} establecida. "
+                "Escribe /salir para terminar."
+            )
+            while not chat.closed.is_set():
+                text = await asyncio.to_thread(input, "yo> ")
+                if text.strip() == "/salir":
+                    break
+                if text:
+                    chat.send_chat(text)
+    except asyncio.TimeoutError:
+        print("No se pudo establecer la conexión WebRTC dentro del tiempo límite.")
+        return 2
+    except (ConnectionClosed, OSError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"Error de conexión: {exc}")
+        return 1
     except (EOFError, KeyboardInterrupt):
         pass
     finally:
-        chat.close()
+        if chat is not None:
+            await chat.close()
     return 0
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Chat P2P de terminal")
-    parser.add_argument("--server", default="127.0.0.1", help="host del servidor de señalización")
-    parser.add_argument("--port", type=int, default=9000, help="puerto TCP de señalización")
+    parser = argparse.ArgumentParser(description="Chat P2P WebRTC de terminal")
+    parser.add_argument("--server", default="127.0.0.1", help="host de señalización")
+    parser.add_argument("--port", type=int, default=9000, help="puerto WebSocket")
     parser.add_argument("--room", required=True, help="código compartido de la sala")
     parser.add_argument("--name", default=f"peer-{secrets.token_hex(3)}", help="nombre visible")
-    parser.add_argument("--udp-port", type=int, default=0, help="puerto UDP local (0 = automático)")
-    raise SystemExit(run(parser.parse_args()))
+    parser.add_argument(
+        "--stun-server", default=DEFAULT_STUN_URL, help="URL del servidor STUN para ICE"
+    )
+    parser.add_argument(
+        "--connect-timeout", type=float, default=30, help="límite de negociación en segundos"
+    )
+    parser.add_argument("--secure", action="store_true", help="usar WSS para señalización")
+    raise SystemExit(asyncio.run(run(parser.parse_args())))
 
 
 if __name__ == "__main__":
     main()
-
