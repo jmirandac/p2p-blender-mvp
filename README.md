@@ -1,18 +1,12 @@
 # Chat P2P WebRTC de terminal
 
-Este proyecto conecta dos terminales mediante un `RTCDataChannel` de WebRTC.
-[`aiortc`](https://github.com/aiortc/aiortc) se encarga de ICE/STUN, la apertura de
-la ruta P2P, DTLS y SCTP; ya no hay un cliente STUN ni un protocolo UDP propios.
+Este proyecto conecta terminales mediante un `RTCDataChannel` de WebRTC. Un
+servidor WebSocket mantiene el registro de peers conectados, permite descubrirlos,
+media el consentimiento entre ellos y retransmite las ofertas y respuestas SDP.
+Los mensajes del chat viajan directamente y cifrados entre los dos peers.
 
-El flujo tiene dos partes:
-
-1. un servidor WebSocket empareja dos clientes que usan el mismo código de sala y
-   retransmite la oferta y respuesta SDP;
-2. una vez negociado el canal, los mensajes del chat viajan directamente y cifrados
-   entre ambos peers mediante WebRTC.
-
-El servidor de señalización ve los identificadores de los peers y las descripciones
-SDP, pero **no recibe ni retransmite mensajes del chat**.
+Una misma conexión con el servidor puede utilizarse para varios chats sucesivos.
+Al terminar un chat, ambos peers vuelven a estar disponibles.
 
 ## Instalación
 
@@ -24,52 +18,90 @@ source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 ```
 
-## Prueba rápida en una sola máquina
+## Prueba rápida
 
 Abre tres terminales desde esta carpeta.
 
-Terminal 1:
+Servidor:
 
 ```bash
 python3 signaling_server.py
 ```
 
-Terminal 2:
+Primer peer:
 
 ```bash
-python3 peer.py --room demo --name alice
+python3 peer.py --name alice
 ```
 
-Terminal 3:
+Segundo peer:
 
 ```bash
-python3 peer.py --room demo --name bob
+python3 peer.py --name bob
 ```
 
-Usa `/salir` para cerrar el chat.
+Cada cliente muestra el ID único asignado por el servidor. Desde cualquiera de
+ellos, ejecuta `/peers`, copia el ID del destino y solicita el chat:
 
-## Prueba entre dos redes distintas
+```text
+/conectar peer_ID_DEL_DESTINO
+```
 
-Ejecuta el servidor de señalización en una máquina accesible desde Internet y
-permite tráfico TCP entrante al puerto 9000:
+El destino debe responder `/aceptar` o `/rechazar`. Después de aceptar y completar
+la negociación, cualquier texto que no comience por `/` se envía por el canal P2P.
+
+## Comandos del cliente
+
+- `/peers`: muestra los peers conectados y si están disponibles u ocupados.
+- `/conectar ID`: solicita un chat con el peer indicado.
+- `/aceptar`: acepta la invitación recibida.
+- `/rechazar`: rechaza la invitación recibida.
+- `/salir`: termina el chat actual y vuelve al estado de espera.
+- `/desconectar`: abandona el servidor y cierra el cliente.
+
+Los nombres visibles pueden repetirse; el ID asignado por el servidor es la
+identidad inequívoca de cada conexión.
+
+## Configuración
+
+El servidor acepta las siguientes opciones:
 
 ```bash
-python3 signaling_server.py --host 0.0.0.0 --port 9000
+python3 signaling_server.py \
+  --host 0.0.0.0 \
+  --port 9000 \
+  --heartbeat-interval 10 \
+  --heartbeat-timeout 20 \
+  --invite-timeout 15 \
+  --negotiation-timeout 30
 ```
 
-Después, en cada peer:
+- El heartbeat WebSocket detecta conexiones que dejan de responder.
+- Una invitación sin respuesta se rechaza al vencer su timeout.
+- Una negociación WebRTC que no abre ambos extremos del canal también expira.
+
+Para acceder a un servidor remoto:
 
 ```bash
-python3 peer.py --server HOST_PUBLICO --port 9000 \
-  --room un-codigo-compartido --name alice
+python3 peer.py --server HOST_PUBLICO --port 9000 --name alice
 ```
 
-El puerto 9000 solo transporta la señalización WebSocket. WebRTC selecciona sus
-propios puertos UDP mediante ICE. El servidor STUN puede cambiarse con
+El puerto 9000 solo transporta registro y señalización. WebRTC selecciona sus
+propios puertos mediante ICE. El servidor STUN puede cambiarse con
 `--stun-server`; para desactivarlo en una red local, usa `--stun-server ""`.
 
 En producción, la señalización debería servirse con TLS y los clientes usar
 `--secure` para conectarse mediante WSS.
+
+## Estados del protocolo
+
+Un peer conectado puede estar en `waiting`, `inviting`, `deciding`, `negotiating`
+o `chatting`. Solo `waiting` está disponible para una nueva invitación. Si un peer
+se desconecta durante una invitación, negociación o chat, el servidor libera al
+otro participante y lo devuelve a `waiting`.
+
+La especificación completa está en [`doc/PLAN.md`](doc/PLAN.md) y el avance de la
+implementación en [`doc/STATUS.md`](doc/STATUS.md).
 
 ## Pruebas automatizadas
 
@@ -77,11 +109,16 @@ En producción, la señalización debería servirse con TLS y los clientes usar
 python3 -m unittest discover -v
 ```
 
-## Límites del MVP
+La suite cubre el protocolo del servidor, los timeouts, la concurrencia y dos chats
+WebRTC sucesivos sin reconectar al signaling server.
 
-- Solo admite dos peers por sala.
-- No autentica usuarios ni protege el código de sala.
+## Límites actuales
+
+- El registro es volátil y local a un único proceso.
+- No hay autenticación ni recuperación de identidad.
+- No se mantienen las antiguas salas ni su protocolo.
+- No se encolan invitaciones y cada peer solo puede participar en una sesión.
 - Incluye STUN pero no configura TURN. Algunos NAT simétricos, firewalls o redes
-  corporativas necesitarán un servidor TURN añadido a `RTCConfiguration`.
-- El canal P2P está cifrado por DTLS, pero el WebSocket de señalización solo usa TLS
-  cuando se despliega detrás de un endpoint WSS.
+  corporativas necesitarán un servidor TURN.
+- El canal P2P está cifrado por DTLS, pero el WebSocket solo usa TLS al desplegarse
+  detrás de un endpoint WSS.

@@ -1,4 +1,4 @@
-"""Terminal chat backed by an aiortc WebRTC data channel."""
+"""Persistent signaling client and terminal chat backed by aiortc."""
 
 from __future__ import annotations
 
@@ -82,11 +82,8 @@ class WebRTCChat:
             if message.get("type") == "chat":
                 self._on_message(str(message.get("text", "")))
             elif message.get("type") == "bye":
-                print(f"\n{self.remote_id} ha cerrado el chat.")
                 self.closed.set()
 
-        # aiortc emits "datachannel" once the remotely-created channel is open,
-        # so the answerer may attach its handlers after the "open" event.
         if channel.readyState == "open":
             self.ready.set()
 
@@ -140,145 +137,393 @@ def _description_from_message(message: dict[str, Any]) -> RTCSessionDescription:
     return RTCSessionDescription(sdp=sdp, type=kind)
 
 
-async def _send_description(
-    websocket: ClientConnection, description: RTCSessionDescription
-) -> None:
-    await websocket.send(
-        json.dumps(
+class SignalingClient:
+    """Maintain one server connection across invitations and P2P chats."""
+
+    def __init__(
+        self,
+        websocket: ClientConnection,
+        name: str,
+        *,
+        stun_url: str = DEFAULT_STUN_URL,
+        on_output: Callable[[str], None] | None = None,
+        on_chat_message: Callable[[str], None] | None = None,
+    ) -> None:
+        self.websocket = websocket
+        self.name = name
+        self.stun_url = stun_url
+        self.peer_id: str | None = None
+        self.state = "registering"
+        self.session_id: str | None = None
+        self.pending_request_id: str | None = None
+        self.remote_peer: dict[str, str] | None = None
+        self.chat: WebRTCChat | None = None
+        self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.disconnected = asyncio.Event()
+        self._receiver_task: asyncio.Task[None] | None = None
+        self._session_tasks: set[asyncio.Task[None]] = set()
+        self._requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._send_lock = asyncio.Lock()
+        self._output = on_output or print
+        self._on_chat_message = on_chat_message
+
+    async def start(self) -> str:
+        await self._send({"type": "register", "name": self.name})
+        message = await self._receive_json()
+        if message.get("type") == "error":
+            raise RuntimeError(str(message.get("message", "registro rechazado")))
+        value = message.get("peer")
+        if message.get("type") != "registered" or not isinstance(value, dict):
+            raise RuntimeError("respuesta de registro inválida")
+        peer_id = value.get("id")
+        if not isinstance(peer_id, str):
+            raise RuntimeError("respuesta de registro inválida")
+        self.peer_id = peer_id
+        self.state = "waiting"
+        self._receiver_task = asyncio.create_task(self._receive_loop())
+        return peer_id
+
+    async def _send(self, message: dict[str, Any]) -> None:
+        async with self._send_lock:
+            await self.websocket.send(json.dumps(message, separators=(",", ":")))
+
+    async def _receive_json(self) -> dict[str, Any]:
+        raw = await self.websocket.recv()
+        if not isinstance(raw, str):
+            raise RuntimeError("respuesta de señalización no textual")
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise RuntimeError("respuesta de señalización inválida")
+        return value
+
+    async def _receive_loop(self) -> None:
+        try:
+            async for raw in self.websocket:
+                if not isinstance(raw, str):
+                    raise RuntimeError("respuesta de señalización no textual")
+                message = json.loads(raw)
+                if not isinstance(message, dict):
+                    raise RuntimeError("respuesta de señalización inválida")
+                await self._handle_message(message)
+                await self.events.put(message)
+        except (ConnectionClosed, json.JSONDecodeError, RuntimeError) as exc:
+            if not self.disconnected.is_set():
+                self._output(f"Conexión de signaling cerrada: {exc}")
+        finally:
+            self.state = "disconnected"
+            self.disconnected.set()
+            await self._close_local_chat()
+
+    async def _handle_message(self, message: dict[str, Any]) -> None:
+        message_type = message.get("type")
+        request_id = message.get("request_id")
+        if isinstance(request_id, str):
+            future = self._requests.pop(request_id, None)
+            if future is not None and not future.done():
+                future.set_result(message)
+
+        if message_type == "peer-list":
+            return
+        if message_type == "connect-pending":
+            self.state = "inviting"
+            self.pending_request_id = self._message_token(message, "request_id")
+            self.session_id = self._message_token(message, "session_id")
+            self._output("Invitación enviada; esperando respuesta.")
+        elif message_type == "connection-request":
+            peer = self._message_peer(message)
+            self.state = "deciding"
+            self.session_id = self._message_token(message, "session_id")
+            self.remote_peer = peer
+            self._output(
+                f"Invitación de {peer['name']} ({peer['id']}). "
+                "Usa /aceptar o /rechazar."
+            )
+        elif message_type == "connection-result":
+            status = str(message.get("status", "unknown"))
+            if status != "accepted":
+                belongs_to_session = (
+                    isinstance(message.get("session_id"), str)
+                    and message.get("session_id") == self.session_id
+                )
+                belongs_to_request = (
+                    isinstance(request_id, str)
+                    and request_id == self.pending_request_id
+                )
+                if belongs_to_request:
+                    self.pending_request_id = None
+                if belongs_to_session or (
+                    belongs_to_request and self.state == "inviting"
+                ):
+                    self.state = "waiting"
+                    self.session_id = None
+                    self.remote_peer = None
+                self._output(f"Invitación finalizada: {status}.")
+        elif message_type == "invitation-expired":
+            if message.get("session_id") == self.session_id:
+                self.state = "waiting"
+                self.session_id = None
+                self.pending_request_id = None
+                self.remote_peer = None
+                self._output("La invitación ha expirado.")
+        elif message_type == "matched":
+            await self._start_negotiation(message)
+        elif message_type == "description":
+            await self._handle_description(message)
+        elif message_type == "chat-started":
+            if message.get("session_id") == self.session_id:
+                self.state = "chatting"
+                assert self.remote_peer is not None
+                self._output(
+                    f"Chat P2P con {self.remote_peer['name']} establecido. "
+                    "Usa /salir para terminarlo."
+                )
+        elif message_type == "session-ended":
+            if message.get("session_id") == self.session_id:
+                reason = str(message.get("reason", "closed"))
+                self.session_id = None
+                self.pending_request_id = None
+                self.remote_peer = None
+                self.state = "waiting"
+                await self._close_local_chat()
+                self._output(f"Sesión finalizada ({reason}). De nuevo en espera.")
+        elif message_type == "error":
+            self._output(
+                f"Error [{message.get('code', 'unknown')}]: "
+                f"{message.get('message', '')}"
+            )
+        elif message_type == "disconnected":
+            self.state = "disconnected"
+            self.disconnected.set()
+
+    @staticmethod
+    def _message_token(message: dict[str, Any], field_name: str) -> str:
+        value = message.get(field_name)
+        if not isinstance(value, str):
+            raise RuntimeError(f"respuesta sin {field_name}")
+        return value
+
+    @classmethod
+    def _message_peer(cls, message: dict[str, Any]) -> dict[str, str]:
+        value = message.get("peer")
+        if not isinstance(value, dict):
+            raise RuntimeError("respuesta sin peer")
+        peer_id = value.get("id")
+        name = value.get("name")
+        if not isinstance(peer_id, str) or not isinstance(name, str):
+            raise RuntimeError("peer inválido")
+        return {"id": peer_id, "name": name}
+
+    async def _start_negotiation(self, message: dict[str, Any]) -> None:
+        if self.peer_id is None:
+            raise RuntimeError("cliente no registrado")
+        session_id = self._message_token(message, "session_id")
+        peer = self._message_peer(message)
+        initiator = message.get("initiator") is True
+        self.state = "negotiating"
+        self.session_id = session_id
+        self.pending_request_id = None
+        self.remote_peer = peer
+        self.chat = WebRTCChat(
+            self.peer_id,
+            peer["id"],
+            stun_url=self.stun_url,
+            on_message=self._on_chat_message,
+        )
+        self._track_session_task(self._watch_chat(self.chat, session_id))
+        if initiator:
+            await self._send_description(session_id, await self.chat.create_offer())
+
+    async def _handle_description(self, message: dict[str, Any]) -> None:
+        session_id = self._message_token(message, "session_id")
+        if session_id != self.session_id or self.chat is None:
+            raise RuntimeError("descripción para una sesión desconocida")
+        description = _description_from_message(message)
+        if description.type == "offer":
+            answer = await self.chat.accept_offer(description)
+            await self._send_description(session_id, answer)
+        else:
+            await self.chat.accept_answer(description)
+
+    async def _send_description(
+        self, session_id: str, description: RTCSessionDescription
+    ) -> None:
+        await self._send(
             {
                 "type": "description",
+                "session_id": session_id,
                 "description": {"sdp": description.sdp, "type": description.type},
-            },
-            separators=(",", ":"),
+            }
         )
-    )
 
+    def _track_session_task(self, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        self._session_tasks.add(task)
+        task.add_done_callback(self._session_tasks.discard)
 
-async def _receive_json(websocket: ClientConnection) -> dict[str, Any]:
-    raw = await websocket.recv()
-    if not isinstance(raw, str):
-        raise RuntimeError("respuesta de señalización no textual")
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise RuntimeError("respuesta de señalización inválida")
-    return value
-
-
-async def _receive_until_ready(
-    websocket: ClientConnection, chat: WebRTCChat
-) -> dict[str, Any] | None:
-    receive_task = asyncio.create_task(_receive_json(websocket))
-    ready_task = asyncio.create_task(chat.ready.wait())
-    closed_task = asyncio.create_task(chat.closed.wait())
-    tasks = {receive_task, ready_task, closed_task}
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for task in pending:
-        task.cancel()
-    for task in pending:
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-    if receive_task in done:
-        return receive_task.result()
-    if ready_task in done and chat.ready.is_set():
-        return None
-    raise RuntimeError("la conexión WebRTC se cerró durante la negociación")
-
-
-async def match_and_connect(
-    websocket: ClientConnection,
-    room: str,
-    peer_id: str,
-    stun_url: str,
-) -> WebRTCChat:
-    await websocket.send(
-        json.dumps(
-            {"type": "join", "room": room, "peer_id": peer_id},
-            separators=(",", ":"),
-        )
-    )
-
-    while True:
-        message = await _receive_json(websocket)
-        message_type = message.get("type")
-        if message_type == "waiting":
-            print("Esperando al segundo participante…")
-        elif message_type == "matched":
-            remote_id = message.get("peer_id")
-            if not isinstance(remote_id, str):
-                raise RuntimeError("respuesta matched inválida")
-            initiator = message.get("initiator") is True
-            break
-        elif message_type == "error":
-            raise RuntimeError(str(message.get("message", "error de señalización")))
-
-    chat = WebRTCChat(peer_id, remote_id, stun_url=stun_url)
-    try:
-        if initiator:
-            await _send_description(websocket, await chat.create_offer())
-
-        while not chat.ready.is_set():
-            message = await _receive_until_ready(websocket, chat)
-            if message is None:
-                break
-            message_type = message.get("type")
-            if message_type == "description":
-                description = _description_from_message(message)
-                if description.type == "offer":
-                    await _send_description(
-                        websocket, await chat.accept_offer(description)
-                    )
-                elif description.type == "answer":
-                    await chat.accept_answer(description)
-            elif message_type == "peer-left":
-                raise RuntimeError("el otro peer se desconectó durante la negociación")
-            elif message_type == "error":
-                raise RuntimeError(
-                    str(message.get("message", "error de señalización"))
+    async def _watch_chat(self, chat: WebRTCChat, session_id: str) -> None:
+        ready_task = asyncio.create_task(chat.ready.wait())
+        closed_task = asyncio.create_task(chat.closed.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {ready_task, closed_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            if ready_task in done and self.session_id == session_id:
+                await self._send({"type": "chat-ready", "session_id": session_id})
+                await chat.closed.wait()
+            if chat.closed.is_set() and self.session_id == session_id:
+                await self._send(
+                    {
+                        "type": "chat-end",
+                        "session_id": session_id,
+                        "reason": "channel-closed",
+                    }
                 )
+        except (ConnectionClosed, asyncio.CancelledError):
+            pass
+        finally:
+            for task in (ready_task, closed_task):
+                if not task.done():
+                    task.cancel()
 
-            if chat.connection.connectionState == "failed":
-                raise RuntimeError("falló la negociación ICE")
-    except BaseException:
-        await chat.close(notify=False)
-        raise
+    async def list_peers(self) -> list[dict[str, str]]:
+        request_id = secrets.token_urlsafe(9)
+        future = asyncio.get_running_loop().create_future()
+        self._requests[request_id] = future
+        await self._send({"type": "list-peers", "request_id": request_id})
+        message = await future
+        peers = message.get("peers")
+        if not isinstance(peers, list):
+            raise RuntimeError("listado de peers inválido")
+        return peers
 
-    return chat
+    async def request_connection(self, target_id: str) -> str:
+        if self.state != "waiting":
+            raise RuntimeError("el peer no está en espera")
+        request_id = secrets.token_urlsafe(9)
+        self.state = "inviting"
+        self.pending_request_id = request_id
+        try:
+            await self._send(
+                {
+                    "type": "connect-request",
+                    "request_id": request_id,
+                    "target_id": target_id,
+                }
+            )
+        except BaseException:
+            self.state = "waiting"
+            self.pending_request_id = None
+            raise
+        return request_id
+
+    async def respond_to_invitation(self, accepted: bool) -> None:
+        if self.state != "deciding" or self.session_id is None:
+            raise RuntimeError("no hay una invitación pendiente")
+        await self._send(
+            {
+                "type": "connection-response",
+                "session_id": self.session_id,
+                "accepted": accepted,
+            }
+        )
+
+    async def end_chat(self, reason: str = "left") -> None:
+        if self.session_id is None or self.state not in ("negotiating", "chatting"):
+            raise RuntimeError("no hay un chat activo")
+        session_id = self.session_id
+        await self._send(
+            {"type": "chat-end", "session_id": session_id, "reason": reason}
+        )
+        await self._close_local_chat()
+
+    async def disconnect(self) -> None:
+        if self.disconnected.is_set():
+            return
+        await self._send({"type": "disconnect"})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self.disconnected.wait(), timeout=2)
+        await self._close_local_chat()
+
+    async def _close_local_chat(self) -> None:
+        chat, self.chat = self.chat, None
+        if chat is not None:
+            await chat.close(notify=False)
+
+    async def wait_for_event(
+        self, event_type: str, *, timeout: float = 5
+    ) -> dict[str, Any]:
+        while True:
+            event = await asyncio.wait_for(self.events.get(), timeout=timeout)
+            if event.get("type") == event_type:
+                return event
+
+    async def aclose(self) -> None:
+        if not self.disconnected.is_set():
+            with contextlib.suppress(ConnectionClosed):
+                await self.disconnect()
+        if self._receiver_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._receiver_task
 
 
 async def run(args: argparse.Namespace) -> int:
     scheme = "wss" if args.secure else "ws"
     uri = f"{scheme}://{args.server}:{args.port}"
-    print(f"Uniéndose a la sala {args.room!r} como {args.name!r}…")
-
-    chat: WebRTCChat | None = None
+    client: SignalingClient | None = None
     try:
         async with connect(uri, open_timeout=10) as websocket:
-            chat = await asyncio.wait_for(
-                match_and_connect(websocket, args.room, args.name, args.stun_server),
-                timeout=args.connect_timeout,
-            )
+            client = SignalingClient(websocket, args.name, stun_url=args.stun_server)
+            peer_id = await client.start()
+            print(f"Registrado como {args.name!r} con ID {peer_id}.")
             print(
-                f"Conexión WebRTC P2P con {chat.remote_id} establecida. "
-                "Escribe /salir para terminar."
+                "Comandos: /peers, /conectar ID, /aceptar, /rechazar, "
+                "/salir, /desconectar"
             )
-            while not chat.closed.is_set():
+            while not client.disconnected.is_set():
                 text = await asyncio.to_thread(input, "yo> ")
-                if text.strip() == "/salir":
-                    break
-                if text:
-                    chat.send_chat(text)
-    except asyncio.TimeoutError:
-        print("No se pudo establecer la conexión WebRTC dentro del tiempo límite.")
-        return 2
+                command = text.strip()
+                try:
+                    if command == "/peers":
+                        peers = await client.list_peers()
+                        if not peers:
+                            print("No hay otros peers conectados.")
+                        for peer in peers:
+                            print(
+                                f"{peer['id']}  {peer['name']}  "
+                                f"[{peer['availability']}]"
+                            )
+                    elif command.startswith("/conectar "):
+                        await client.request_connection(command.split(maxsplit=1)[1])
+                    elif command == "/aceptar":
+                        await client.respond_to_invitation(True)
+                    elif command == "/rechazar":
+                        await client.respond_to_invitation(False)
+                    elif command == "/salir":
+                        await client.end_chat()
+                    elif command == "/desconectar":
+                        await client.disconnect()
+                        break
+                    elif command.startswith("/"):
+                        print("Comando desconocido.")
+                    elif command:
+                        if client.state != "chatting" or client.chat is None:
+                            print("No hay un chat activo.")
+                        else:
+                            client.chat.send_chat(text)
+                except (RuntimeError, KeyError) as exc:
+                    print(f"Error: {exc}")
     except (ConnectionClosed, OSError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"Error de conexión: {exc}")
         return 1
     except (EOFError, KeyboardInterrupt):
-        pass
+        if client is not None:
+            with contextlib.suppress(ConnectionClosed):
+                await client.disconnect()
     finally:
-        if chat is not None:
-            await chat.close()
+        if client is not None:
+            await client._close_local_chat()
     return 0
 
 
@@ -286,13 +531,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Chat P2P WebRTC de terminal")
     parser.add_argument("--server", default="127.0.0.1", help="host de señalización")
     parser.add_argument("--port", type=int, default=9000, help="puerto WebSocket")
-    parser.add_argument("--room", required=True, help="código compartido de la sala")
-    parser.add_argument("--name", default=f"peer-{secrets.token_hex(3)}", help="nombre visible")
     parser.add_argument(
-        "--stun-server", default=DEFAULT_STUN_URL, help="URL del servidor STUN para ICE"
+        "--name", default=f"peer-{secrets.token_hex(3)}", help="nombre visible"
     )
     parser.add_argument(
-        "--connect-timeout", type=float, default=30, help="límite de negociación en segundos"
+        "--stun-server", default=DEFAULT_STUN_URL, help="URL del servidor STUN para ICE"
     )
     parser.add_argument("--secure", action="store_true", help="usar WSS para señalización")
     raise SystemExit(asyncio.run(run(parser.parse_args())))
