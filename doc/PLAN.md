@@ -67,6 +67,8 @@ al estado de espera cuando termina el chat.
 - Timeout de heartbeat: 20 segundos; intervalo de ping: 10 segundos.
 - Timeout de invitación: 15 segundos.
 - Timeout de negociación: 30 segundos.
+- Espera máxima bloqueante para recopilar candidatos STUN: 0,5 segundos,
+  configurable mediante `--ice-gather-timeout`.
 - El heartbeat permanece activo durante todos los estados.
 - La CLI elimina `--room`, muestra el ID asignado y ofrece `/peers`,
   `/conectar ID`, `/aceptar`, `/rechazar`, `/salir` y `/desconectar`.

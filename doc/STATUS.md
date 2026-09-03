@@ -23,7 +23,9 @@
 | H6 | Cliente terminal interactivo | Completada | H2–H5 | CLI maneja comandos, eventos asíncronos y varios chats por conexión | `SignalingClient` y prueba de dos chats WebRTC consecutivos |
 | H7 | Pruebas integrales y concurrencia | Completada | H1–H6 | Suite unitaria e integración completa en verde | 10 pruebas en verde, incluida concurrencia y dos chats WebRTC consecutivos |
 | H8 | Documentación y validación final | Completada | H7 | README actualizado, revisión final superada y estado general completado | README y ayuda CLI verificados; `git diff --check` y compilación correctos |
+| H9 | Eliminar espera fija de recolección ICE | Completada | H8 | STUN conserva candidato público sin bloquear cinco segundos la negociación | Oferta reducida de 5,009 s a 0,506 s conservando `srflx`; flujo aceptación–chat en 1,051 s; 11 pruebas en verde |
 
 ## Registro de cambios de alcance
 
 - 2026-09-04: plan aprobado para implementación sin cambios de alcance.
+- 2026-09-04: se añade H9 tras detectar una espera de cinco segundos durante la recolección ICE/STUN.

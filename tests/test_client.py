@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import AsyncMock
 
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
@@ -9,6 +10,31 @@ from p2pchat.signaling import SignalingServer
 
 
 class WebRTCChatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_caps_ice_gathering_wait_per_peer_connection(self) -> None:
+        chat = WebRTCChat(
+            "alice",
+            "bob",
+            stun_url="stun:example.test:3478",
+            ice_gather_timeout=0.25,
+        )
+        try:
+            chat._attach_channel(chat.connection.createDataChannel("chat"))
+            assert chat.connection.sctp is not None
+            ice_connection = (
+                chat.connection.sctp.transport.transport.iceGatherer._connection
+            )
+            original = AsyncMock(return_value=[])
+            ice_connection.get_component_candidates = original
+
+            chat._limit_ice_gathering()
+            await ice_connection.get_component_candidates(1, ["192.0.2.1"])
+
+            original.assert_awaited_once_with(
+                1, ["192.0.2.1"], timeout=0.25
+            )
+        finally:
+            await chat.close(notify=False)
+
     async def test_negotiates_data_channel_and_delivers_message(self) -> None:
         received: list[str] = []
         delivered = asyncio.Event()

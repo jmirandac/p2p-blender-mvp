@@ -80,6 +80,18 @@ python3 signaling_server.py \
 - Una invitación sin respuesta se rechaza al vencer su timeout.
 - Una negociación WebRTC que no abre ambos extremos del canal también expira.
 
+El cliente limita por defecto a 0,5 segundos la espera bloqueante de candidatos
+STUN. Esto evita que interfaces VPN o virtuales sin respuesta introduzcan la pausa
+fija de cinco segundos de `aioice`, conservando los candidatos host y los
+candidatos STUN que respondan dentro de ese intervalo:
+
+```bash
+python3 peer.py --name alice --ice-gather-timeout 0.5
+```
+
+El valor puede aumentarse en redes con mucha latencia. Esta opción no es el
+timeout global de negociación del signaling server.
+
 Para acceder a un servidor remoto:
 
 ```bash

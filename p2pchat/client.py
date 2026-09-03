@@ -22,6 +22,7 @@ from websockets.exceptions import ConnectionClosed
 
 
 DEFAULT_STUN_URL = "stun:stun.l.google.com:19302"
+DEFAULT_ICE_GATHER_TIMEOUT = 0.5
 
 
 class WebRTCChat:
@@ -33,8 +34,11 @@ class WebRTCChat:
         remote_id: str,
         *,
         stun_url: str = DEFAULT_STUN_URL,
+        ice_gather_timeout: float | None = DEFAULT_ICE_GATHER_TIMEOUT,
         on_message: Callable[[str], None] | None = None,
     ) -> None:
+        if ice_gather_timeout is not None and ice_gather_timeout <= 0:
+            raise ValueError("el timeout de recolección ICE debe ser positivo")
         configuration = RTCConfiguration(
             iceServers=[RTCIceServer(urls=stun_url)] if stun_url else []
         )
@@ -44,6 +48,9 @@ class WebRTCChat:
         self.channel: RTCDataChannel | None = None
         self.ready = asyncio.Event()
         self.closed = asyncio.Event()
+        self.ice_gather_timeout = ice_gather_timeout
+        self._uses_ice_server = bool(stun_url)
+        self._ice_gathering_limited = False
         self._on_message = on_message or self._print_message
 
         @self.connection.on("datachannel")
@@ -89,6 +96,7 @@ class WebRTCChat:
 
     async def create_offer(self) -> RTCSessionDescription:
         self._attach_channel(self.connection.createDataChannel("chat"))
+        self._limit_ice_gathering()
         await self.connection.setLocalDescription(await self.connection.createOffer())
         assert self.connection.localDescription is not None
         return self.connection.localDescription
@@ -97,12 +105,45 @@ class WebRTCChat:
         self, description: RTCSessionDescription
     ) -> RTCSessionDescription:
         await self.connection.setRemoteDescription(description)
+        self._limit_ice_gathering()
         await self.connection.setLocalDescription(await self.connection.createAnswer())
         assert self.connection.localDescription is not None
         return self.connection.localDescription
 
     async def accept_answer(self, description: RTCSessionDescription) -> None:
         await self.connection.setRemoteDescription(description)
+
+    def _limit_ice_gathering(self) -> None:
+        """Cap aioice's fixed five-second wait across local interfaces.
+
+        aiortc doesn't expose aioice's candidate-gathering timeout. Applying the
+        limit to this peer connection keeps host candidates and any STUN response
+        received within the configured window, while avoiding a five-second wait
+        for unreachable VPN or virtual interfaces.
+        """
+        if (
+            self._ice_gathering_limited
+            or self.ice_gather_timeout is None
+            or not self._uses_ice_server
+        ):
+            return
+        sctp = self.connection.sctp
+        if sctp is None:
+            raise RuntimeError("transporte SCTP no inicializado")
+        ice_connection = sctp.transport.transport.iceGatherer._connection
+        original = ice_connection.get_component_candidates
+        configured_timeout = self.ice_gather_timeout
+
+        async def get_component_candidates(
+            component: int, addresses: list[str], timeout: int = 5
+        ) -> Any:
+            del timeout
+            return await original(
+                component, addresses, timeout=configured_timeout
+            )
+
+        ice_connection.get_component_candidates = get_component_candidates
+        self._ice_gathering_limited = True
 
     def send_chat(self, text: str) -> None:
         if self.channel is None or self.channel.readyState != "open":
@@ -146,12 +187,14 @@ class SignalingClient:
         name: str,
         *,
         stun_url: str = DEFAULT_STUN_URL,
+        ice_gather_timeout: float | None = DEFAULT_ICE_GATHER_TIMEOUT,
         on_output: Callable[[str], None] | None = None,
         on_chat_message: Callable[[str], None] | None = None,
     ) -> None:
         self.websocket = websocket
         self.name = name
         self.stun_url = stun_url
+        self.ice_gather_timeout = ice_gather_timeout
         self.peer_id: str | None = None
         self.state = "registering"
         self.session_id: str | None = None
@@ -327,6 +370,7 @@ class SignalingClient:
             self.peer_id,
             peer["id"],
             stun_url=self.stun_url,
+            ice_gather_timeout=self.ice_gather_timeout,
             on_message=self._on_chat_message,
         )
         self._track_session_task(self._watch_chat(self.chat, session_id))
@@ -474,7 +518,12 @@ async def run(args: argparse.Namespace) -> int:
     client: SignalingClient | None = None
     try:
         async with connect(uri, open_timeout=10) as websocket:
-            client = SignalingClient(websocket, args.name, stun_url=args.stun_server)
+            client = SignalingClient(
+                websocket,
+                args.name,
+                stun_url=args.stun_server,
+                ice_gather_timeout=args.ice_gather_timeout,
+            )
             peer_id = await client.start()
             print(f"Registrado como {args.name!r} con ID {peer_id}.")
             print(
@@ -536,6 +585,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--stun-server", default=DEFAULT_STUN_URL, help="URL del servidor STUN para ICE"
+    )
+    parser.add_argument(
+        "--ice-gather-timeout",
+        type=float,
+        default=DEFAULT_ICE_GATHER_TIMEOUT,
+        help="espera máxima de candidatos STUN en segundos",
     )
     parser.add_argument("--secure", action="store_true", help="usar WSS para señalización")
     raise SystemExit(asyncio.run(run(parser.parse_args())))
