@@ -28,6 +28,29 @@ Servidor:
 python3 signaling_server.py
 ```
 
+### Ejecución con Docker
+
+Construye la imagen del servidor de señalización:
+
+```bash
+docker build -t p2p-signaling-server .
+```
+
+Inicia el contenedor y publica el puerto 9000 en el host:
+
+```bash
+docker run --rm --name p2p-signaling -p 9000:9000 p2p-signaling-server
+```
+
+El servidor queda disponible en `ws://localhost:9000`. Los argumentos del
+servidor se pueden personalizar reemplazando el comando de la imagen, por ejemplo:
+
+```bash
+docker run --rm -p 9000:9000 p2p-signaling-server \
+  --host 0.0.0.0 --port 9000 \
+  --heartbeat-interval 15 --heartbeat-timeout 30
+```
+
 Primer peer:
 
 ```bash
