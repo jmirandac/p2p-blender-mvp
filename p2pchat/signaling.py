@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import secrets
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -587,15 +589,43 @@ async def run_server(
         await server.serve_forever()
 
 
-def main() -> None:
+def parse_server_args(
+    argv: Sequence[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> argparse.Namespace:
+    environment = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(description="Señalización WebSocket para el chat P2P")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=9000)
-    parser.add_argument("--heartbeat-interval", type=float, default=10)
-    parser.add_argument("--heartbeat-timeout", type=float, default=20)
-    parser.add_argument("--invite-timeout", type=float, default=15)
-    parser.add_argument("--negotiation-timeout", type=float, default=30)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--host", default=environment.get("SIGNALING_HOST", "0.0.0.0")
+    )
+    parser.add_argument(
+        "--port", type=int, default=environment.get("SIGNALING_PORT", 9000)
+    )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=environment.get("SIGNALING_HEARTBEAT_INTERVAL", 10),
+    )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        default=environment.get("SIGNALING_HEARTBEAT_TIMEOUT", 20),
+    )
+    parser.add_argument(
+        "--invite-timeout",
+        type=float,
+        default=environment.get("SIGNALING_INVITE_TIMEOUT", 15),
+    )
+    parser.add_argument(
+        "--negotiation-timeout",
+        type=float,
+        default=environment.get("SIGNALING_NEGOTIATION_TIMEOUT", 30),
+    )
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = parse_server_args()
     try:
         asyncio.run(
             run_server(

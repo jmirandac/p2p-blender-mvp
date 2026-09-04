@@ -43,7 +43,29 @@ docker run --rm --name p2p-signaling -p 9000:9000 p2p-signaling-server
 ```
 
 El servidor queda disponible en `ws://localhost:9000`. Los argumentos del
-servidor se pueden personalizar reemplazando el comando de la imagen, por ejemplo:
+servidor se pueden configurar mediante variables de entorno:
+
+| Variable | Parámetro | Valor por defecto |
+| --- | --- | ---: |
+| `SIGNALING_HOST` | `--host` | `0.0.0.0` |
+| `SIGNALING_PORT` | `--port` | `9000` |
+| `SIGNALING_HEARTBEAT_INTERVAL` | `--heartbeat-interval` | `10` |
+| `SIGNALING_HEARTBEAT_TIMEOUT` | `--heartbeat-timeout` | `20` |
+| `SIGNALING_INVITE_TIMEOUT` | `--invite-timeout` | `15` |
+| `SIGNALING_NEGOTIATION_TIMEOUT` | `--negotiation-timeout` | `30` |
+
+Por ejemplo:
+
+```bash
+docker run --rm --name p2p-signaling -p 9000:9000 \
+  -e SIGNALING_HEARTBEAT_INTERVAL=15 \
+  -e SIGNALING_HEARTBEAT_TIMEOUT=30 \
+  p2p-signaling-server
+```
+
+Si una variable no está definida, se conserva el valor actual por defecto. Los
+argumentos de línea de comandos también siguen disponibles y tienen prioridad
+sobre las variables de entorno:
 
 ```bash
 docker run --rm -p 9000:9000 p2p-signaling-server \

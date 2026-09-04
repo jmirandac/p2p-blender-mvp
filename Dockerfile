@@ -19,4 +19,3 @@ USER signaling
 EXPOSE 9000
 
 ENTRYPOINT ["python", "signaling_server.py"]
-CMD ["--host", "0.0.0.0", "--port", "9000"]

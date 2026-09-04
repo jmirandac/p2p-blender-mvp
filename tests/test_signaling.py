@@ -5,7 +5,48 @@ import unittest
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import serve
 
-from p2pchat.signaling import SignalingServer
+from p2pchat.signaling import SignalingServer, parse_server_args
+
+
+class SignalingConfigurationTests(unittest.TestCase):
+    def test_uses_current_defaults_without_environment_variables(self) -> None:
+        args = parse_server_args([], {})
+
+        self.assertEqual(args.host, "0.0.0.0")
+        self.assertEqual(args.port, 9000)
+        self.assertEqual(args.heartbeat_interval, 10)
+        self.assertEqual(args.heartbeat_timeout, 20)
+        self.assertEqual(args.invite_timeout, 15)
+        self.assertEqual(args.negotiation_timeout, 30)
+
+    def test_reads_configuration_from_environment_variables(self) -> None:
+        args = parse_server_args(
+            [],
+            {
+                "SIGNALING_HOST": "127.0.0.1",
+                "SIGNALING_PORT": "9100",
+                "SIGNALING_HEARTBEAT_INTERVAL": "11.5",
+                "SIGNALING_HEARTBEAT_TIMEOUT": "21.5",
+                "SIGNALING_INVITE_TIMEOUT": "16.5",
+                "SIGNALING_NEGOTIATION_TIMEOUT": "31.5",
+            },
+        )
+
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 9100)
+        self.assertEqual(args.heartbeat_interval, 11.5)
+        self.assertEqual(args.heartbeat_timeout, 21.5)
+        self.assertEqual(args.invite_timeout, 16.5)
+        self.assertEqual(args.negotiation_timeout, 31.5)
+
+    def test_command_line_arguments_take_precedence_over_environment(self) -> None:
+        args = parse_server_args(
+            ["--port", "9200", "--invite-timeout", "17"],
+            {"SIGNALING_PORT": "9100", "SIGNALING_INVITE_TIMEOUT": "16"},
+        )
+
+        self.assertEqual(args.port, 9200)
+        self.assertEqual(args.invite_timeout, 17)
 
 
 class SignalingTests(unittest.IsolatedAsyncioTestCase):
