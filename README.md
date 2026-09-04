@@ -131,7 +131,7 @@ fija de cinco segundos de `aioice`, conservando los candidatos host y los
 candidatos STUN que respondan dentro de ese intervalo:
 
 ```bash
-python3 peer.py --name sinkro --ice-gather-timeout 0.5
+python3 peer.py --name iponoo --ice-gather-timeout 0.5
 ```
 
 El valor puede aumentarse en redes con mucha latencia. Esta opción no es el
