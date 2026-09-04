@@ -76,13 +76,13 @@ docker run --rm -p 9000:9000 p2p-signaling-server \
 Primer peer:
 
 ```bash
-python3 peer.py --name alice
+python3 peer.py --name sinkro
 ```
 
 Segundo peer:
 
 ```bash
-python3 peer.py --name bob
+python3 peer.py --name iponoo
 ```
 
 Cada cliente muestra el ID único asignado por el servidor. Desde cualquiera de
